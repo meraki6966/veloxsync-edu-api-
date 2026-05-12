@@ -91,6 +91,61 @@ async function callTogetherAI(
   return data.choices?.[0]?.message?.content || 'No response generated.';
 }
 
+// ── ANTHROPIC API CALL (Claude Sonnet 4) ────────────────────
+// Education-side functions route here; HR-side functions continue to use
+// callTogetherAI above (fine-tuned Llama). Same Message[] shape as
+// callTogetherAI so each call site is a near-rename — the helper lifts the
+// system role out of the messages array because Anthropic puts it at the
+// top level of the request body.
+
+const ANTHROPIC_MODEL = 'claude-sonnet-4-20250514';
+
+async function callAnthropic(
+  messages: Message[],
+  maxTokens: number = 1000,
+  options: { jsonMode?: boolean } = {},
+): Promise<string> {
+  const systemContent = messages
+    .filter(m => m.role === 'system')
+    .map(m => m.content)
+    .join('\n\n');
+  const conversation = messages
+    .filter(m => m.role !== 'system')
+    .map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }));
+
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': process.env.ANTHROPIC_API_KEY || '',
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: ANTHROPIC_MODEL,
+      max_tokens: maxTokens,
+      ...(systemContent ? { system: systemContent } : {}),
+      messages: conversation,
+    }),
+  });
+
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`Anthropic API error: ${response.status} — ${err}`);
+  }
+
+  const data: any = await response.json();
+  let text: string = data.content?.[0]?.text || 'No response generated.';
+
+  // Anthropic has no native JSON mode. When the caller asked for JSON, strip
+  // any ```json fences the model added and trim to the outermost {...}.
+  if (options.jsonMode) {
+    text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+    const m = text.match(/\{[\s\S]*\}/);
+    if (m) text = m[0];
+  }
+  return text;
+}
+
 // ── PUBLIC EI-CORE METHODS ──────────────────────────────────
 
 /**
@@ -128,7 +183,7 @@ What should the teacher do next?`,
     },
   ];
 
-  return callTogetherAI(messages, 150); // 150 tokens max — keeps costs low
+  return callAnthropic(messages, 1000);
 }
 
 /**
@@ -161,7 +216,7 @@ Provide a clear, step-by-step version.`,
     },
   ];
 
-  return callTogetherAI(messages, 200);
+  return callAnthropic(messages, 1000);
 }
 
 /**
@@ -197,7 +252,7 @@ Give me a brief wellness summary and one recommended action for today.`,
     },
   ];
 
-  return callTogetherAI(messages, 120);
+  return callAnthropic(messages, 1000);
 }
 
 /**
@@ -217,7 +272,7 @@ export async function eiCoreChat(params: {
     content: `You are Ei-Core, VeloxSync's AI co-pilot for educators. You help teachers understand student wellness, cognitive load, and intervention strategies. Be warm, empathetic, and specific. Never use corporate HR jargon. Always center student wellbeing.${params.orgContext ? `\n\nContext: ${params.orgContext}` : ''}`,
   };
 
-  return callTogetherAI([systemMessage, ...params.messages], 300);
+  return callAnthropic([systemMessage, ...params.messages], 1000);
 }
 
 // ── EI-CORE EDUCATION METHODS ────────────────────────────────
@@ -342,7 +397,7 @@ Return a JSON object with EXACTLY these keys:
   ];
 
   try {
-    const raw = await callTogetherAI(messages, 500, { jsonMode: true });
+    const raw = await callAnthropic(messages, 1000, { jsonMode: true });
     return JSON.parse(raw);
   } catch {
     return {
@@ -429,7 +484,7 @@ Return a JSON object with EXACTLY these keys:
   ];
 
   try {
-    const raw = await callTogetherAI(messages, 500, { jsonMode: true });
+    const raw = await callAnthropic(messages, 1000, { jsonMode: true });
     return JSON.parse(raw);
   } catch {
     return {
@@ -513,7 +568,7 @@ Return a JSON object with EXACTLY these keys:
   ];
 
   try {
-    const raw = await callTogetherAI(messages, 500, { jsonMode: true });
+    const raw = await callAnthropic(messages, 1000, { jsonMode: true });
     return JSON.parse(raw);
   } catch {
     return {
@@ -1184,11 +1239,11 @@ ${studentData.cognitive_friction_events.map((e, i) => `${i + 1}. ${e}`).join('\n
 
 Generate the full four-section portfolio narrative now.`;
 
-  return callTogetherAI(
+  return callAnthropic(
     [
       { role: 'system', content: SOVEREIGN_SYSTEM_PROMPT },
       { role: 'user', content: userMessage },
     ],
-    2048,
+    1000,
   );
 }
