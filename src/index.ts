@@ -8,6 +8,7 @@ import eduIntegrationsRoutes, { gcOAuthRouter } from './routes/edu-integrations'
 import eduParentPortalRoutes from './routes/edu-parent-portal'
 import { authMiddleware } from './middleware/auth'
 import { eduTrialCheck } from './middleware/eduTrialCheck'
+import { runMigrations } from './db/migrate'
 
 dotenv.config()
 
@@ -28,5 +29,9 @@ app.use('/api/edu/integrations', gcOAuthRouter)
 // All other edu-integrations routes require auth + trial check
 app.use('/api/edu/integrations', authMiddleware, eduTrialCheck, eduIntegrationsRoutes)
 
-const PORT = process.env.PORT || 3001
-app.listen(PORT, () => console.log(`VeloxSync Edu API running on port ${PORT}`))
+const PORT = parseInt(process.env.PORT || '8080', 10)
+
+;(async () => {
+  await runMigrations()
+  app.listen(PORT, () => console.log(`VeloxSync Edu API running on port ${PORT}`))
+})()
