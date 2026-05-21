@@ -3,6 +3,7 @@ import cors from 'cors'
 import helmet from 'helmet'
 import dotenv from 'dotenv'
 import authRoutes from './routes/auth'
+import dashboardRoutes from './routes/dashboard'
 import educationV2Routes from './routes/education-v2'
 import eduBillingRoutes from './routes/edu-billing'
 import eduIntegrationsRoutes, { gcOAuthRouter } from './routes/edu-integrations'
@@ -24,6 +25,9 @@ app.get('/health', (_, res) => res.json({ status: 'ok', service: 'veloxsync-edu-
 
 // Public auth routes (register, login) — must be mounted before authMiddleware-guarded routes
 app.use('/api/auth', authRoutes)
+
+// Dashboard routes (e.g. /me) — protected by authMiddleware, used to verify a session on page load
+app.use('/api/dashboard', authMiddleware, dashboardRoutes)
 
 app.use('/api/edu/parent', eduParentPortalRoutes)
 app.use('/api/edu/billing', eduBillingRoutes)
