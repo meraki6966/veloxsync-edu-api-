@@ -2,6 +2,7 @@ import express from 'express'
 import cors from 'cors'
 import helmet from 'helmet'
 import dotenv from 'dotenv'
+import authRoutes from './routes/auth'
 import educationV2Routes from './routes/education-v2'
 import eduBillingRoutes from './routes/edu-billing'
 import eduIntegrationsRoutes, { gcOAuthRouter } from './routes/edu-integrations'
@@ -20,6 +21,9 @@ app.use('/api/edu/billing/webhook', express.raw({ type: 'application/json' }))
 app.use(express.json())
 
 app.get('/health', (_, res) => res.json({ status: 'ok', service: 'veloxsync-edu-api' }))
+
+// Public auth routes (register, login) — must be mounted before authMiddleware-guarded routes
+app.use('/api/auth', authRoutes)
 
 app.use('/api/edu/parent', eduParentPortalRoutes)
 app.use('/api/edu/billing', eduBillingRoutes)
