@@ -570,8 +570,8 @@ router.post('/homeschool/children', async (req: AuthRequest, res: Response) => {
     );
     res.status(201).json({ child: result.rows[0] });
   } catch (err: any) {
-    console.error('[edu] POST /homeschool/children', err.message);
-    res.status(500).json({ error: 'Failed to add child' });
+    console.error('[edu] POST /homeschool/children error:', err.message, err.stack)
+    res.status(500).json({ error: err.message })
   }
 });
 
