@@ -220,6 +220,18 @@ const MIGRATIONS: Migration[] = [
     `,
   },
 
+  // ── 8a. drop curriculum_type CHECK on homeschool_children ─────────────────
+  // The frontend sends Title Case + spaces ("Charlotte Mason", "Eclectic", …)
+  // but the original CHECK required lowercase/underscored values. Dropping the
+  // constraint lets any string through. Idempotent — safe on every boot.
+  {
+    name: 'alter:homeschool_children_drop_curriculum_type_check',
+    sql: `
+      ALTER TABLE homeschool_children
+        DROP CONSTRAINT IF EXISTS homeschool_children_curriculum_type_check;
+    `,
+  },
+
   // ── 9. behavior_logs ──────────────────────────────────────────────────────
   // Mirrors the inline block in routes/education-v2.ts (≈ line 2343).
   {

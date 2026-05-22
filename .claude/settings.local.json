@@ -6,7 +6,9 @@
       "Bash(git commit *)",
       "Bash(git push *)",
       "PowerShell(npx tsc)",
-      "PowerShell(git add *)"
+      "PowerShell(git add *)",
+      "PowerShell(git commit *)",
+      "PowerShell(git push *)"
     ]
   }
 }
