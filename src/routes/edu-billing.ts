@@ -21,13 +21,25 @@ const EDU_PRICE_MAP: Record<string, string> = {
   teacher_pro:      process.env.EDU_STRIPE_PRICE_TEACHER_PRO || '',
   homeschool_family: process.env.EDU_STRIPE_PRICE_HOMESCHOOL  || '',
   school_license:   process.env.EDU_STRIPE_PRICE_SCHOOL       || '',
+  // Family Plan — billed monthly or annually (Education Family Plan checkout)
+  family_monthly:   process.env.EDU_STRIPE_PRICE_MONTHLY      || '',
+  family_annual:    process.env.EDU_STRIPE_PRICE_ANNUAL       || '',
 };
 
 const EDU_PLAN_NAMES: Record<string, string> = {
   teacher_pro:       'Teacher Pro',
   homeschool_family: 'Homeschool Family',
   school_license:    'School License',
+  family_monthly:    'Family Plan (Monthly)',
+  family_annual:     'Family Plan (Annual)',
 };
+
+// Map a Family Plan billing cadence to its plan key.
+function familyPlanFromPriceType(priceType: unknown): string | null {
+  if (priceType === 'annual')  return 'family_annual';
+  if (priceType === 'monthly') return 'family_monthly';
+  return null;
+}
 
 // ── ENSURE TABLE EXISTS ──────────────────────────────────────
 pool.query(`
@@ -59,7 +71,11 @@ function getUser(req: AuthRequest) {
 router.post('/checkout', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const { userId, orgId } = getUser(req);
-    const { plan, success_url, cancel_url } = req.body;
+    const { priceType, success_url, cancel_url } = req.body;
+
+    // Accept either an explicit plan key or a Family Plan billing cadence
+    // (priceType: 'monthly' | 'annual'). priceType wins when provided.
+    const plan: string = familyPlanFromPriceType(priceType) ?? req.body.plan;
 
     if (!plan || !EDU_PRICE_MAP[plan]) {
       return res.status(400).json({
