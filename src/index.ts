@@ -8,6 +8,7 @@ import educationV2Routes from './routes/education-v2'
 import eduBillingRoutes from './routes/edu-billing'
 import eduIntegrationsRoutes, { gcOAuthRouter } from './routes/edu-integrations'
 import eduParentPortalRoutes from './routes/edu-parent-portal'
+import eduSupportRoutes from './routes/edu-support'
 import { authMiddleware } from './middleware/auth'
 import { eduTrialCheck } from './middleware/eduTrialCheck'
 import { runMigrations } from './db/migrate'
@@ -29,6 +30,8 @@ app.use('/api/auth', authRoutes)
 // Dashboard routes (e.g. /me) — protected by authMiddleware, used to verify a session on page load
 app.use('/api/dashboard', authMiddleware, dashboardRoutes)
 
+// Support contact — public (no auth) so logged-out users can reach support
+app.use('/api/edu/support', eduSupportRoutes)
 app.use('/api/edu/parent', eduParentPortalRoutes)
 app.use('/api/edu/billing', eduBillingRoutes)
 app.use('/api/edu', authMiddleware, eduTrialCheck, educationV2Routes)
