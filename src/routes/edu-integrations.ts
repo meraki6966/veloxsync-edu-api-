@@ -4,12 +4,23 @@
 // Google Classroom, Clever, PowerSchool, Canvas, ClassDojo,
 // Renaissance Learning
 // ============================================================
+//
+// What "connected" means here: a row is reported connected only when the
+// credentials that provider needs are actually stored. Credentials are
+// encrypted at rest with encryptToken (AES-256-GCM, ENCRYPTION_KEY) and are
+// never returned by any route.
+//
+// No provider has a live sync yet. /:provider/sync answers 501 and /status
+// reports sync_available: false, so the page never shows a sync that did not
+// happen.
 
 import { Router, Request, Response } from 'express';
 import jwt from 'jsonwebtoken';
+import { createHmac, randomUUID } from 'crypto';
 import { pool } from '../db';
 import { AuthRequest } from '../middleware/auth';
 import { encryptToken } from '../utils/crypto';
+import { requireJwtSecret } from '../utils/jwtSecret';
 
 const router = Router();
 
@@ -24,7 +35,31 @@ const VALID_PROVIDERS = [
 ] as const;
 type Provider = typeof VALID_PROVIDERS[number];
 
-// ── ENSURE TABLE EXISTS ──────────────────────────────────────
+// Credentials each provider needs before it counts as connected.
+const REQUIRED_FIELDS: Record<Provider, string[]> = {
+  google_classroom: ['access_token'],
+  clever:           ['client_id', 'client_secret'],
+  powerschool:      ['server_url', 'client_id', 'client_secret'],
+  canvas:           ['domain', 'access_token'],
+  classdojo:        ['api_key'],
+  renaissance:      ['tenant_id', 'api_key'],
+};
+
+// Stored encrypted.
+const SECRET_FIELDS = new Set(['access_token', 'refresh_token', 'client_secret', 'api_key']);
+
+const DISPLAY_NAMES: Record<Provider, string> = {
+  google_classroom: 'Google Classroom',
+  clever:           'Clever',
+  powerschool:      'PowerSchool',
+  canvas:           'Canvas LMS',
+  classdojo:        'ClassDojo',
+  renaissance:      'Renaissance Learning',
+};
+
+const MAX_FIELD_LENGTH = 2000;
+
+// ── ENSURE TABLES EXIST ──────────────────────────────────────
 // Runs once on module load — idempotent
 pool.query(`
   CREATE TABLE IF NOT EXISTS edu_oauth_sessions (
@@ -47,46 +82,50 @@ pool.query(`
   CREATE INDEX IF NOT EXISTS idx_edu_integrations_org ON edu_integrations(organization_id);
 `).catch(err => console.error('[edu-integrations] table init failed:', err.message));
 
-// ── HELPER ───────────────────────────────────────────────────
+// ── HELPERS ──────────────────────────────────────────────────
 function getOrgId(req: AuthRequest): string {
   return (req.user as { organizationId: string }).organizationId;
 }
 
-function isValidProvider(p: string): p is Provider {
-  return (VALID_PROVIDERS as readonly string[]).includes(p);
+const PROVIDER_ALIASES: Record<string, Provider> = {
+  power_school: 'powerschool',
+  class_dojo: 'classdojo',
+  renaissance_star: 'renaissance',
+};
+
+/** Accepts hyphen or underscore spellings and the old page ids. */
+export function normalizeProvider(raw: unknown): Provider | null {
+  if (typeof raw !== 'string') return null;
+  const p = raw.trim().toLowerCase().replace(/-/g, '_');
+  const resolved = PROVIDER_ALIASES[p] ?? p;
+  return (VALID_PROVIDERS as readonly string[]).includes(resolved) ? (resolved as Provider) : null;
 }
 
-// ── MOCK SYNC DATA ───────────────────────────────────────────
-const MOCK_GOOGLE_ROSTER = {
-  provider: 'google_classroom',
-  synced_at: new Date().toISOString(),
-  courses: [
-    {
-      id: 'gc_course_001',
-      name: '3rd Grade ELA — Room 12',
-      section: 'Period 1',
-      students: [
-        { id: 'gc_s_001', first_name: 'Amara', last_name: 'Johnson', email: 'amara.j@school.edu' },
-        { id: 'gc_s_002', first_name: 'Liam',  last_name: 'Torres',  email: 'liam.t@school.edu' },
-        { id: 'gc_s_003', first_name: 'Sofia', last_name: 'Patel',   email: 'sofia.p@school.edu' },
-        { id: 'gc_s_004', first_name: 'Noah',  last_name: 'Kim',     email: 'noah.k@school.edu' },
-        { id: 'gc_s_005', first_name: 'Zoe',   last_name: 'Carter',  email: 'zoe.c@school.edu' },
-      ],
-    },
-    {
-      id: 'gc_course_002',
-      name: '3rd Grade Math — Room 12',
-      section: 'Period 2',
-      students: [
-        { id: 'gc_s_001', first_name: 'Amara', last_name: 'Johnson', email: 'amara.j@school.edu' },
-        { id: 'gc_s_003', first_name: 'Sofia', last_name: 'Patel',   email: 'sofia.p@school.edu' },
-        { id: 'gc_s_006', first_name: 'Ethan', last_name: 'Brown',   email: 'ethan.b@school.edu' },
-      ],
-    },
-  ],
-  total_students_imported: 6,
-  note: 'Mock sync — connect a real Google Classroom OAuth token to pull live data.',
-};
+function nonEmpty(value: unknown): value is string {
+  return typeof value === 'string' && value.trim() !== '';
+}
+
+/** True only when every credential the provider needs is stored. */
+export function hasCredentials(provider: Provider, config: unknown): boolean {
+  const c = (config && typeof config === 'object' ? config : {}) as Record<string, unknown>;
+  return REQUIRED_FIELDS[provider].every(f => nonEmpty(c[f]));
+}
+
+// Canvas domain: a bare hostname such as school.instructure.com.
+function normalizeHost(value: string): string | null {
+  const host = value.trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '').toLowerCase();
+  return /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(host) ? host : null;
+}
+
+// PowerSchool server: an https URL.
+function normalizeHttpsUrl(value: string): string | null {
+  try {
+    const u = new URL(value.trim());
+    return u.protocol === 'https:' ? u.origin : null;
+  } catch {
+    return null;
+  }
+}
 
 // ============================================================
 // GET /api/edu/integrations/status
@@ -96,15 +135,14 @@ router.get('/status', async (req: AuthRequest, res: Response) => {
     const orgId = getOrgId(req);
 
     // Seed rows for any providers not yet in the table
-    const upsertQueries = VALID_PROVIDERS.map(provider =>
+    await Promise.all(VALID_PROVIDERS.map(provider =>
       pool.query(
         `INSERT INTO edu_integrations (organization_id, provider)
          VALUES ($1, $2)
          ON CONFLICT (organization_id, provider) DO NOTHING`,
         [orgId, provider]
       )
-    );
-    await Promise.all(upsertQueries);
+    ));
 
     const result = await pool.query(
       `SELECT provider, connected, config, connected_at
@@ -116,13 +154,16 @@ router.get('/status', async (req: AuthRequest, res: Response) => {
 
     const statusMap: Record<string, object> = {};
     for (const row of result.rows) {
-      // Only report connected=true when explicitly connected with a timestamp
-      const isConnected = row.connected === true && row.connected_at !== null;
-      statusMap[row.provider] = {
-        connected: isConnected,
-        connected_at: isConnected ? row.connected_at : null,
-        display_name: isConnected ? (row.config?.display_name || null) : null,
-        sync_enabled: isConnected ? (row.config?.sync_enabled ?? false) : false,
+      const provider = normalizeProvider(row.provider);
+      if (!provider) continue;
+      // Rows written by the old handlers could say connected with nothing
+      // stored. Only stored credentials count.
+      const isConnected = row.connected === true && row.connected_at !== null && hasCredentials(provider, row.config);
+      statusMap[provider] = {
+        connected:      isConnected,
+        connected_at:   isConnected ? row.connected_at : null,
+        display_name:   DISPLAY_NAMES[provider],
+        sync_available: false,
       };
     }
 
@@ -134,269 +175,46 @@ router.get('/status', async (req: AuthRequest, res: Response) => {
 });
 
 // ============================================================
-// POST /api/edu/integrations/:provider/connect  (shared handler)
-// All fields are optional — store whatever is provided, never 400
+// POST /api/edu/integrations/google-classroom/auth-url
+// Signed-in users start Google sign-in here. The org is taken from the
+// verified login token and carried to the callback in a signed, short-lived,
+// single-use state. The login token itself never goes into a URL.
 // ============================================================
-async function handleConnect(
-  req: AuthRequest,
-  res: Response,
-  provider: Provider,
-  _requiredFields: string[],
-  configBuilder: (body: Record<string, string>) => Record<string, unknown>
-) {
-  try {
-    const orgId = getOrgId(req);
-    const config = configBuilder(req.body || {});
-
-    const result = await pool.query(
-      `INSERT INTO edu_integrations (organization_id, provider, connected, config, connected_at)
-       VALUES ($1, $2, TRUE, $3, NOW())
-       ON CONFLICT (organization_id, provider) DO UPDATE
-         SET connected = TRUE, config = $3, connected_at = NOW()
-       RETURNING id, provider, connected, connected_at`,
-      [orgId, provider, JSON.stringify(config)]
-    );
-
-    res.json({ integration: result.rows[0] });
-  } catch (err: any) {
-    console.error(`[edu-integrations] POST /${provider}/connect`, err.message);
-    res.status(500).json({ error: `Failed to connect ${provider}` });
-  }
-}
-
-// ── GOOGLE CLASSROOM ─────────────────────────────────────────
-router.post('/google-classroom/connect', (req: AuthRequest, res: Response) =>
-  handleConnect(req, res, 'google_classroom', ['access_token'], (body) => ({
-    access_token:  body.access_token,
-    refresh_token: body.refresh_token || null,
-    display_name:  'Google Classroom',
-    sync_enabled:  true,
-  }))
-);
-
-// POST /api/edu/integrations/google-classroom/sync
-router.post('/google-classroom/sync', async (req: AuthRequest, res: Response) => {
-  try {
-    const orgId = getOrgId(req);
-    const row = await pool.query(
-      `SELECT connected FROM edu_integrations WHERE organization_id = $1 AND provider = 'google_classroom'`,
-      [orgId]
-    );
-    if (!row.rows[0]?.connected) {
-      return res.status(400).json({ error: 'Google Classroom is not connected. Connect it first.' });
-    }
-    // In production: use stored access_token to call Google Classroom API.
-    // Returning mock roster for now.
-    res.json({ sync: MOCK_GOOGLE_ROSTER });
-  } catch (err: any) {
-    console.error('[edu-integrations] POST /google-classroom/sync', err.message);
-    res.status(500).json({ error: 'Sync failed' });
-  }
-});
-
-// ── CLEVER ───────────────────────────────────────────────────
-router.post('/clever/connect', (req: AuthRequest, res: Response) =>
-  handleConnect(req, res, 'clever', ['client_id', 'client_secret'], (body) => ({
-    client_id:    body.client_id,
-    client_secret: body.client_secret,
-    district_id:  body.district_id || null,
-    display_name: 'Clever',
-    sync_enabled: true,
-  }))
-);
-
-// ── POWERSCHOOL ──────────────────────────────────────────────
-router.post('/powerschool/connect', (req: AuthRequest, res: Response) =>
-  handleConnect(req, res, 'powerschool', ['server_url', 'client_id', 'client_secret'], (body) => ({
-    server_url:    body.server_url,
-    client_id:     body.client_id,
-    client_secret: body.client_secret,
-    display_name:  'PowerSchool',
-    sync_enabled:  true,
-  }))
-);
-
-// ── CANVAS ───────────────────────────────────────────────────
-router.post('/canvas/connect', (req: AuthRequest, res: Response) =>
-  handleConnect(req, res, 'canvas', ['domain', 'access_token'], (body) => ({
-    domain:       body.domain,
-    access_token: body.access_token,
-    display_name: 'Canvas LMS',
-    sync_enabled: true,
-  }))
-);
-
-// ── CLASSDOJO ────────────────────────────────────────────────
-router.post('/classdojo/connect', (req: AuthRequest, res: Response) =>
-  handleConnect(req, res, 'classdojo', ['api_key'], (body) => ({
-    api_key:      body.api_key,
-    display_name: 'ClassDojo',
-    sync_enabled: true,
-  }))
-);
-
-// ── RENAISSANCE ──────────────────────────────────────────────
-router.post('/renaissance/connect', (req: AuthRequest, res: Response) =>
-  handleConnect(req, res, 'renaissance', ['tenant_id', 'api_key'], (body) => ({
-    tenant_id:    body.tenant_id,
-    api_key:      body.api_key,
-    display_name: 'Renaissance Learning',
-    sync_enabled: true,
-  }))
-);
-
-// ── UNDERSCORE ALIASES (google_classroom, power_school, class_dojo) ──────────
-// Frontend may call either hyphen or underscore variants — both work
-router.post('/google_classroom/connect',  (req: AuthRequest, res: Response) =>
-  handleConnect(req, res, 'google_classroom', [], (body) => ({
-    access_token: body.access_token || null, refresh_token: body.refresh_token || null,
-    display_name: 'Google Classroom', sync_enabled: true,
-  }))
-);
-router.post('/google_classroom/sync', async (req: AuthRequest, res: Response) => {
-  const orgId = getOrgId(req);
-  const row = await pool.query(
-    `SELECT connected FROM edu_integrations WHERE organization_id = $1 AND provider = 'google_classroom'`,
-    [orgId]
-  ).catch(() => ({ rows: [] }));
-  if (!(row as any).rows[0]?.connected) {
-    return res.status(400).json({ error: 'Google Classroom is not connected. Connect it first.' });
-  }
-  res.json({ sync: MOCK_GOOGLE_ROSTER });
-});
-router.post('/powerschool/connect',   (req: AuthRequest, res: Response) =>
-  handleConnect(req, res, 'powerschool', [], (body) => ({
-    server_url: body.server_url || null, client_id: body.client_id || null,
-    client_secret: body.client_secret || null, display_name: 'PowerSchool', sync_enabled: true,
-  }))
-);
-router.post('/power_school/connect',  (req: AuthRequest, res: Response) =>
-  handleConnect(req, res, 'powerschool', [], (body) => ({
-    server_url: body.server_url || null, client_id: body.client_id || null,
-    client_secret: body.client_secret || null, display_name: 'PowerSchool', sync_enabled: true,
-  }))
-);
-router.post('/classdojo/connect',     (req: AuthRequest, res: Response) =>
-  handleConnect(req, res, 'classdojo', [], (body) => ({
-    api_key: body.api_key || null, display_name: 'ClassDojo', sync_enabled: true,
-  }))
-);
-router.post('/class_dojo/connect',    (req: AuthRequest, res: Response) =>
-  handleConnect(req, res, 'classdojo', [], (body) => ({
-    api_key: body.api_key || null, display_name: 'ClassDojo', sync_enabled: true,
-  }))
-);
-router.post('/clever/connect',        (req: AuthRequest, res: Response) =>
-  handleConnect(req, res, 'clever', [], (body) => ({
-    client_id: body.client_id || null, client_secret: body.client_secret || null,
-    district_id: body.district_id || null, display_name: 'Clever', sync_enabled: true,
-  }))
-);
-router.post('/canvas/connect',        (req: AuthRequest, res: Response) =>
-  handleConnect(req, res, 'canvas', [], (body) => ({
-    domain: body.domain || null, access_token: body.access_token || null,
-    display_name: 'Canvas LMS', sync_enabled: true,
-  }))
-);
-router.post('/renaissance/connect',   (req: AuthRequest, res: Response) =>
-  handleConnect(req, res, 'renaissance', [], (body) => ({
-    tenant_id: body.tenant_id || null, api_key: body.api_key || null,
-    display_name: 'Renaissance Learning', sync_enabled: true,
-  }))
-);
-
-// ============================================================
-// DELETE /api/edu/integrations/:provider/disconnect
-// ============================================================
-router.delete('/:provider/disconnect', async (req: AuthRequest, res: Response) => {
-  try {
-    const orgId = getOrgId(req);
-    // Normalise hyphen/underscore variants (google-classroom → google_classroom)
-    const provider = (req.params.provider as string).replace(/-/g, '_');
-
-    if (!isValidProvider(provider)) {
-      return res.status(400).json({
-        error: `Unknown provider. Valid providers: ${VALID_PROVIDERS.join(', ')}`,
-      });
-    }
-
-    await pool.query(
-      `UPDATE edu_integrations
-       SET connected = FALSE, config = '{}', connected_at = NULL
-       WHERE organization_id = $1 AND provider = $2`,
-      [orgId, provider]
-    );
-
-    res.json({ disconnected: true, provider });
-  } catch (err: any) {
-    console.error('[edu-integrations] DELETE /:provider/disconnect', err.message);
-    res.status(500).json({ error: 'Failed to disconnect integration' });
-  }
-});
-
-// ============================================================
-// PUBLIC OAuth router (no authMiddleware — browser redirects)
-// Registered separately in index.ts at /api/edu/integrations
-// ============================================================
-
-export const gcOAuthRouter = Router();
-
 const GC_SCOPES = [
   'https://www.googleapis.com/auth/classroom.courses.readonly',
   'https://www.googleapis.com/auth/classroom.rosters.readonly',
 ].join(' ');
 
+const STATE_PURPOSE = 'edu-gc-oauth';
+
 function gcRedirectUri(): string {
   return 'https://veloxsync.up.railway.app/api/edu/integrations/google-classroom/callback';
 }
 
-// ── GET /google-classroom/auth ───────────────────────────────
-// Called by the frontend via browser redirect — Authorization headers won't be sent.
-// Token sources tried in order:
-//   1. ?token=<jwt> query param
-//   2. Authorization: Bearer <jwt> header
-//   3. Common cookie names (token, auth_token, jwt, access_token)
-// If none found → proceed anyway with state={ pending:true }.
-// The callback resolves the org via Google userinfo email lookup.
-// NEVER returns an error for a missing token.
-gcOAuthRouter.get('/google-classroom/auth', async (req: Request, res: Response) => {
+// A key derived from JWT_SECRET for OAuth state only, so a state can never be
+// used as a login token and a login token can never be used as a state.
+function stateKey(): Buffer {
+  return createHmac('sha256', requireJwtSecret()).update('edu-gc-oauth-state-v1').digest();
+}
+
+router.post('/google-classroom/auth-url', async (req: AuthRequest, res: Response) => {
   try {
-    const clientId  = process.env.GOOGLE_CLIENT_ID;
-    if (!clientId) return res.status(500).json({ error: 'GOOGLE_CLIENT_ID not configured' });
+    const clientId = process.env.GOOGLE_CLIENT_ID;
+    if (!clientId) return res.status(503).json({ error: 'Google Classroom sign-in is not configured.' });
 
-    const jwtSecret = process.env.JWT_SECRET;
-    if (!jwtSecret) return res.status(500).json({ error: 'JWT_SECRET not configured' });
+    const orgId = getOrgId(req);
+    const userId = req.user?.userId;
+    const nonce = randomUUID();
 
-    // Extract token from any available source
-    const queryToken  = req.query.token as string | undefined;
-    const authHeader  = req.headers.authorization as string | undefined;
-    const headerToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : undefined;
-    const cookies     = (req as any).cookies as Record<string, string> | undefined;
-    const cookieToken = cookies
-      ? (cookies['token'] || cookies['auth_token'] || cookies['jwt'] || cookies['access_token'])
-      : undefined;
+    await pool.query(
+      `INSERT INTO edu_oauth_sessions (id, expires_at) VALUES ($1, NOW() + INTERVAL '10 minutes')`,
+      [nonce]
+    );
 
-    const userToken = queryToken || headerToken || cookieToken;
-
-    let statePayload: object;
-
-    if (userToken) {
-      try {
-        const payload = jwt.verify(userToken, jwtSecret) as any;
-        const orgId   = payload.organizationId as string;
-        statePayload  = { orgId };
-      } catch {
-        // Token present but invalid — fall through to pending; don't error
-        console.warn('[edu-integrations] /google-classroom/auth: token present but invalid, proceeding as pending');
-        statePayload = { pending: true };
-      }
-    } else {
-      // No token at all — proceed; org resolved at callback via Google email lookup
-      console.warn('[edu-integrations] /google-classroom/auth: no token found, proceeding as pending');
-      statePayload = { pending: true };
-    }
-
-    const state = jwt.sign(statePayload, jwtSecret, { expiresIn: '15m' });
+    const state = jwt.sign({ orgId, userId, nonce, purpose: STATE_PURPOSE }, stateKey(), {
+      algorithm: 'HS256',
+      expiresIn: '10m',
+    });
 
     const params = new URLSearchParams({
       client_id:     clientId,
@@ -408,41 +226,148 @@ gcOAuthRouter.get('/google-classroom/auth', async (req: Request, res: Response) 
       state,
     });
 
-    res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`);
-  } catch (err) {
-    console.error('[edu-integrations] /google-classroom/auth error:', err);
-    res.status(500).json({ error: 'Failed to initiate Google Classroom OAuth' });
+    res.json({ url: `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}` });
+  } catch (err: any) {
+    console.error('[edu-integrations] POST /google-classroom/auth-url', err.message);
+    res.status(500).json({ error: 'Could not start Google sign-in' });
   }
 });
 
-// ── GET /google-classroom/callback ──────────────────────────
+// ============================================================
+// POST /api/edu/integrations/:provider/connect
+// ============================================================
+router.post('/:provider/connect', async (req: AuthRequest, res: Response) => {
+  const provider = normalizeProvider(req.params.provider);
+  if (!provider) {
+    return res.status(400).json({ error: `Unknown provider. Valid providers: ${VALID_PROVIDERS.join(', ')}` });
+  }
+  if (provider === 'google_classroom') {
+    return res.status(400).json({ error: 'Google Classroom connects through Sign in with Google.' });
+  }
+
+  const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, unknown>;
+  const missing = REQUIRED_FIELDS[provider].filter(f => !nonEmpty(body[f]));
+  if (missing.length > 0) {
+    return res.status(400).json({ error: `Missing required fields: ${missing.join(', ')}` });
+  }
+  if (REQUIRED_FIELDS[provider].some(f => (body[f] as string).length > MAX_FIELD_LENGTH)) {
+    return res.status(400).json({ error: 'A field is too long.' });
+  }
+
+  const config: Record<string, unknown> = { display_name: DISPLAY_NAMES[provider] };
+  for (const field of REQUIRED_FIELDS[provider]) {
+    const value = (body[field] as string).trim();
+    if (field === 'domain') {
+      const host = normalizeHost(value);
+      if (!host) return res.status(400).json({ error: 'domain must be a hostname such as school.instructure.com' });
+      config.domain = host;
+    } else if (field === 'server_url') {
+      const url = normalizeHttpsUrl(value);
+      if (!url) return res.status(400).json({ error: 'server_url must be an https URL' });
+      config.server_url = url;
+    } else {
+      config[field] = value;
+    }
+  }
+  if (provider === 'clever' && nonEmpty(body.district_id)) {
+    config.district_id = (body.district_id as string).trim().slice(0, 200);
+  }
+
+  try {
+    for (const field of Object.keys(config)) {
+      if (SECRET_FIELDS.has(field)) config[field] = encryptToken(config[field] as string);
+    }
+
+    const orgId = getOrgId(req);
+    const result = await pool.query(
+      `INSERT INTO edu_integrations (organization_id, provider, connected, config, connected_at)
+       VALUES ($1, $2, TRUE, $3, NOW())
+       ON CONFLICT (organization_id, provider) DO UPDATE
+         SET connected = TRUE, config = $3, connected_at = NOW()
+       RETURNING id, provider, connected, connected_at`,
+      [orgId, provider, JSON.stringify(config)]
+    );
+
+    res.json({ integration: result.rows[0] });
+  } catch (err: any) {
+    // encryptToken throws when ENCRYPTION_KEY is missing. Refusing is safer
+    // than storing the credential in plain text.
+    console.error(`[edu-integrations] POST /${provider}/connect`, err.message);
+    res.status(500).json({ error: `Failed to connect ${DISPLAY_NAMES[provider]}` });
+  }
+});
+
+// ============================================================
+// POST /api/edu/integrations/:provider/sync
+// ============================================================
+router.post('/:provider/sync', (req: AuthRequest, res: Response) => {
+  const provider = normalizeProvider(req.params.provider);
+  if (!provider) return res.status(400).json({ error: 'Unknown provider' });
+  // There is no live sync for any provider yet. Say so instead of returning
+  // sample data as if it came from the school's system.
+  res.status(501).json({ error: `Sync for ${DISPLAY_NAMES[provider]} is not available yet.` });
+});
+
+// ============================================================
+// DELETE /api/edu/integrations/:provider/disconnect
+// ============================================================
+router.delete('/:provider/disconnect', async (req: AuthRequest, res: Response) => {
+  const provider = normalizeProvider(req.params.provider);
+  if (!provider) {
+    return res.status(400).json({ error: `Unknown provider. Valid providers: ${VALID_PROVIDERS.join(', ')}` });
+  }
+  try {
+    const orgId = getOrgId(req);
+    await pool.query(
+      `UPDATE edu_integrations
+       SET connected = FALSE, config = '{}', connected_at = NULL
+       WHERE organization_id = $1 AND provider = $2`,
+      [orgId, provider]
+    );
+    res.json({ disconnected: true, provider });
+  } catch (err: any) {
+    console.error('[edu-integrations] DELETE /:provider/disconnect', err.message);
+    res.status(500).json({ error: 'Failed to disconnect integration' });
+  }
+});
+
+// ============================================================
+// PUBLIC router: only Google's redirect back to us lives here.
+// Mounted in index.ts BEFORE any auth middleware on /api/edu, because Google's
+// browser redirect carries no Authorization header. It trusts nothing but a
+// state this server signed for a signed-in user, used once, within 10 minutes.
+// ============================================================
+export const gcOAuthRouter = Router();
+
 gcOAuthRouter.get('/google-classroom/callback', async (req: Request, res: Response) => {
   const frontendUrl = process.env.FRONTEND_URL || 'https://veloxsync.app';
   const successUrl  = `${frontendUrl}/education/integrations?connected=google-classroom`;
   const errorUrl    = `${frontendUrl}/education/integrations?error=google-classroom`;
 
-  const { code, state, error } = req.query as Record<string, string>;
+  const { code, state, error } = req.query as Record<string, string | undefined>;
+  if (error || !code || !state) return res.redirect(errorUrl);
 
-  if (error || !code || !state) {
-    console.error('[edu-integrations] callback denied or missing params:', { error, code: !!code, state: !!state });
-    return res.redirect(errorUrl);
-  }
-
-  const jwtSecret = process.env.JWT_SECRET;
-  if (!jwtSecret) return res.redirect(errorUrl);
-
-  let orgId: string | undefined;
-  let pending = false;
+  let orgId: string;
+  let nonce: string;
   try {
-    const payload = jwt.verify(state, jwtSecret) as any;
-    orgId   = payload.orgId;
-    pending = !!payload.pending;
+    const claims = jwt.verify(state, stateKey(), { algorithms: ['HS256'] }) as Record<string, unknown>;
+    if (claims.purpose !== STATE_PURPOSE || !nonEmpty(claims.orgId) || !nonEmpty(claims.nonce)) {
+      return res.redirect(errorUrl);
+    }
+    orgId = claims.orgId;
+    nonce = claims.nonce;
   } catch {
-    console.error('[edu-integrations] invalid state JWT');
     return res.redirect(errorUrl);
   }
 
   try {
+    // Single use: the nonce row is consumed here, so a replayed state fails.
+    const used = await pool.query(
+      `DELETE FROM edu_oauth_sessions WHERE id = $1 AND expires_at > NOW() RETURNING id`,
+      [nonce]
+    );
+    if (used.rowCount === 0) return res.redirect(errorUrl);
+
     const clientId     = process.env.GOOGLE_CLIENT_ID;
     const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
     if (!clientId || !clientSecret) {
@@ -461,52 +386,20 @@ gcOAuthRouter.get('/google-classroom/callback', async (req: Request, res: Respon
         grant_type:    'authorization_code',
       }),
     });
-
-    const tokens = await tokenRes.json() as any;
-    if (!tokens.access_token) {
-      console.error('[edu-integrations] token exchange failed:', tokens);
-      return res.redirect(errorUrl);
-    }
-
-    // Pending path: no org in state — resolve via Google userinfo email
-    if (!orgId && pending) {
-      const userinfoRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
-        headers: { Authorization: `Bearer ${tokens.access_token}` },
-      });
-      const userinfo = await userinfoRes.json() as any;
-      const email    = userinfo.email as string | undefined;
-
-      if (email) {
-        const userRow = await pool.query(
-          `SELECT organization_id FROM users WHERE email = $1 LIMIT 1`,
-          [email]
-        );
-        if (userRow.rows[0]) {
-          orgId = userRow.rows[0].organization_id as string;
-          console.log('[edu-integrations] pending callback resolved org via email:', email);
-        }
-      }
-
-      if (!orgId) {
-        console.error('[edu-integrations] callback: could not resolve org from Google email');
-        return res.redirect(errorUrl);
-      }
-    }
-
-    if (!orgId) {
-      console.error('[edu-integrations] callback: could not determine orgId');
+    const tokens = await tokenRes.json() as Record<string, unknown>;
+    if (!nonEmpty(tokens.access_token)) {
+      console.error('[edu-integrations] token exchange failed');
       return res.redirect(errorUrl);
     }
 
     const config = {
       access_token:  encryptToken(tokens.access_token),
-      refresh_token: tokens.refresh_token ? encryptToken(tokens.refresh_token) : null,
+      refresh_token: nonEmpty(tokens.refresh_token) ? encryptToken(tokens.refresh_token) : null,
       token_expiry:  tokens.expires_in
         ? new Date(Date.now() + Number(tokens.expires_in) * 1000).toISOString()
         : null,
-      scope:         tokens.scope ?? GC_SCOPES,
-      display_name:  'Google Classroom',
-      sync_enabled:  true,
+      scope:         typeof tokens.scope === 'string' ? tokens.scope : GC_SCOPES,
+      display_name:  DISPLAY_NAMES.google_classroom,
     };
 
     await pool.query(
@@ -520,8 +413,8 @@ gcOAuthRouter.get('/google-classroom/callback', async (req: Request, res: Respon
     );
 
     res.redirect(successUrl);
-  } catch (err) {
-    console.error('[edu-integrations] callback exchange error:', err);
+  } catch (err: any) {
+    console.error('[edu-integrations] callback error:', err?.message);
     res.redirect(errorUrl);
   }
 });

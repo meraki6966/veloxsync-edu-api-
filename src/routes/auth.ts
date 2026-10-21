@@ -3,9 +3,10 @@ import { Router } from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { pool } from '../db';
+import { requireJwtSecret } from '../utils/jwtSecret';
 
 const router = Router();
-const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret';
+const JWT_SECRET = requireJwtSecret();
 
 // Register new organization + user
 router.post('/register', async (req, res) => {
