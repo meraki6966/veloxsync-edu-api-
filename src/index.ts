@@ -34,9 +34,13 @@ app.use('/api/dashboard', authMiddleware, dashboardRoutes)
 app.use('/api/edu/support', eduSupportRoutes)
 app.use('/api/edu/parent', eduParentPortalRoutes)
 app.use('/api/edu/billing', eduBillingRoutes)
-app.use('/api/edu', authMiddleware, eduTrialCheck, educationV2Routes)
-// Google Classroom OAuth — public (no auth): /auth redirect + /callback from Google
+// Google Classroom OAuth callback — public, because Google's browser redirect
+// carries no Authorization header. It must be mounted before the protected
+// /api/edu mount below, or authMiddleware answers 401 first. The router holds
+// only the callback, which trusts nothing but a single-use state signed for a
+// signed-in user (see edu-integrations.ts).
 app.use('/api/edu/integrations', gcOAuthRouter)
+app.use('/api/edu', authMiddleware, eduTrialCheck, educationV2Routes)
 // All other edu-integrations routes require auth + trial check
 app.use('/api/edu/integrations', authMiddleware, eduTrialCheck, eduIntegrationsRoutes)
 
